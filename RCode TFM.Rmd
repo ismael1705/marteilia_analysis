@@ -1,0 +1,369 @@
+---
+title: "Código completo en R TFM"
+author: "Ismael Manzanares García"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval=FALSE)
+library(DESeq2)
+library(pasilla)
+library(GEOquery)
+library(ggplot2)
+library(EnhancedVolcano)
+library(MLSeq)
+library(vsn)
+library(dplyr)
+library(class)
+library(pheatmap)
+library(biomaRt)
+library(AnnotationDbi)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+```
+
+### Fusión de las matrices procedentes de FeatureCounts
+
+```{r fusion matrices}
+#Leer los archivos y crear data frame de cada uno
+
+archivos<- list.files(pattern = "^counts_.*\\.txt$")
+
+lista_matrices<-c()
+for (i in 1:length(archivos)){
+  a1<- read.table(archivos[i])
+  str<-archivos[i]
+  muestra<-substr(str, 8,17)
+  df_general<-data.frame(a1$V1,as.numeric(a1$V7))
+  colnames(df_general)<-c(df_general[1,1],muestra)
+  df_general<-df_general[-1,]
+  indice_ordenacion<-order(df_general[,2], decreasing = TRUE)
+  df_ordenado<-df_general[indice_ordenacion, ]
+  lista_matrices[[muestra]]<-df_ordenado
+}
+
+
+#Tenemos todas las matrices individuales en una lista. 
+#Fusionamos todas en la misma matriz.
+
+matriz_total<-Reduce(function(x,y) merge(x,y,by=1, all=TRUE), lista_matrices)
+matriz_total[is.na(matriz_total)]<-0
+rownames(matriz_total)<-matriz_total[,1]
+matriz_total<-matriz_total[,-1]
+
+#Guardamos la matriz
+#write.table(matriz_total,'counts_totales.txt', sep="\t", row.names = TRUE, col.names=TRUE)
+
+
+```
+
+### Análisis Convencional
+
+```{r eval=FALSE}
+#Lectura de la matriz de expresión primaria y de los fenotipos
+cts<-read.delim('counts_totales.txt')
+coldata<-read.delim('coldata.txt')
+rownames(coldata)<-coldata[,1]
+coldata<-coldata[,-1]
+cts<-cts[rowSums(cts != 0) > 0, ]
+
+#Conversión en un objeto DESeqData
+dds <- DESeqDataSetFromMatrix(countData = cts,
+                              colData = coldata,
+                              design = ~ condition)
+
+featureData <- data.frame(gene=rownames(cts))
+mcols(dds) <- DataFrame(mcols(dds), featureData)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+dds$condition <- factor(dds$condition, 
+                        levels = c("infected","wild_type"))
+
+#Normalización
+dds <- DESeq(dds)
+normalized_counts <- counts(dds, normalized = TRUE)
+log_normalized_counts <- log2(normalized_counts + 1)
+res <- results(dds, contrast=c("condition","infected","wild_type"))
+
+
+#Shrinkage
+par(mfrow=c(1,3), mar=c(4,4,2,1))
+xlim <- c(1,1e5); ylim <- c(-7,7)
+plotMA(resLFC, xlim=xlim, ylim=ylim, main="apeglm")
+plotMA(resNorm, xlim=xlim, ylim=ylim, main="normal")
+plotMA(resAsh, xlim=xlim, ylim=ylim, main="ashr")
+
+
+#png("shrinkage.png", width = 1000, height = 600, res = 120)
+par(mfrow=c(1,3), mar=c(4,4,2,1))
+xlim <- c(1,1e5); ylim <- c(-7,7)
+plotMA(resLFC, xlim=xlim, ylim=ylim, main="apeglm")
+plotMA(resNorm, xlim=xlim, ylim=ylim, main="normal")
+plotMA(resAsh, xlim=xlim, ylim=ylim, main="ashr")
+#dev.off()
+
+#Plot de los counts per gene
+#png("counts_significativos.png", width = 1000, height = 1000, res = 120)
+# Configuración de parámetros para mostrar varios gráficos en la misma ventana
+par(mfrow = c(3, 2))  # Divide la ventana en filas y columnas
+sum(res05$padj < 0.05, na.rm=TRUE)
+resOrdered <- res[order(res05$padj),]
+significant_genes <- rownames(res05)[res05$padj < 0.05]
+significant_genes <-na.omit(significant_genes)
+# Hacer un bucle sobre los genes significativos y generar los gráficos
+for (gene_index in significant_genes) {
+    plotCounts(dds, gene = gene_index, intgroup = "condition")
+}
+#dev.off()
+
+#Transformaciones de la varianza
+vsd <- vst(dds, blind=FALSE)
+rld <- rlog(dds, blind=FALSE)
+ntd <- normTransform(dds)
+
+# Convertir los datos a un formato adecuado para ggplot
+df_ntd <- data.frame(mean = rowMeans(assay(ntd)), sd = apply(assay(ntd), 1, sd), transformation = "Shifted Log Transformation")
+df_vsd <- data.frame(mean = rowMeans(assay(vsd)), sd = apply(assay(vsd), 1, sd), transformation = "Variance Stabilizing Transformation")
+df_rld <- data.frame(mean = rowMeans(assay(rld)), sd = apply(assay(rld), 1, sd), transformation = "Regularized Log Transformation")
+
+# Combinar los datos en un solo marco de datos
+df_all <- rbind(df_ntd, df_vsd, df_rld)
+
+# Crear el gráfico utilizando ggplot
+gg<-ggplot(df_all, aes(x = mean, y = sd, color = transformation)) +
+  geom_point() +
+  geom_smooth(se = FALSE) +
+  labs(x = "Mean", y = "Standard Deviation", color = "Transformation") + facet_wrap(~ transformation, scales = "free") + theme(legend.position = "none")
+gg  
+#ggsave("transformaciones_varianza.png", gg, width = 20, height = 10, units = "cm", dpi = 500)
+
+#Heatmap de expresión
+select <- order(rowMeans(counts(dds,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(dds)[,c("condition","type")])
+#png("heatmap.png", width = 1000, height = 600
+#    , res = 120)
+pheatmap(assay(vsd)[select,], cluster_rows=FALSE, show_rownames=FALSE,
+         cluster_cols=FALSE, annotation_col=df)
+#dev.off()
+
+#PCA
+pcaData <- plotPCA(vsd, intgroup=c("condition", "type"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+gg <- ggplot(pcaData, aes(PC1, PC2, color = condition, shape = type, label = rownames(pcaData))) +
+  geom_point(size = 3) +
+  geom_text(hjust = 0, vjust = 0) +  # Ajusta la posición del texto
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance"))+
+  xlim(-100, 300)  # Establece el rango del eje X
+gg
+#ggsave('PCA.png', gg, width = 20, height = 10, units = "cm", dpi = 500)
+
+dds <- estimateSizeFactors(dds)
+dds <- estimateDispersions(dds)
+dds <- nbinomWaldTest(dds)
+
+#Gráfico de dispersion
+#png("dispersion.png", width = 1000, height = 600
+#    , res = 120)
+plotDispEsts(dds)
+#dev.off()
+
+#Outliers
+#png("outliers.png", width = 1000, height = 600  , res = 120)
+par(mar=c(8,5,2,2))
+boxplot(log10(assays(dds)[["cooks"]]), range = 0, las = 2, col = c(rep("red", 3), rep("blue", 3)), 
+        main = "Boxplot de valores de Cook's distance", xlab = "", ylab = "Log10 de Cook's distance")
+#dev.off()
+
+#Gráfico de filtrado independiente
+#png("independent_filter.png", width = 1000, height = 600, res = 120)
+metadata(res)$alpha
+metadata(res)$filterThreshold
+plot(metadata(res)$filterNumRej, 
+     type="b", ylab="number of rejections",
+     xlab="quantiles of filter")
+lines(metadata(res)$lo.fit, col="red")
+abline(v=metadata(res)$filterTheta)
+#dev.off()
+
+#Test de Wald a 0.5 y 0.33
+#png("wald_0.5.png", width = 1000, height = 800, res = 120)
+par(mfrow=c(2,2),mar=c(2,2,1,1))
+ylim <- c(-7,7)
+resGA <- results(dds, lfcThreshold=.5, altHypothesis="greaterAbs")
+resLA <- results(dds, lfcThreshold=.5, altHypothesis="lessAbs")
+resG <- results(dds, lfcThreshold=.5, altHypothesis="greater")
+resL <- results(dds, lfcThreshold=.5, altHypothesis="less")
+drawLines <- function() abline(h=c(-.5,.5),col="dodgerblue",lwd=2)
+plotMA(resGA, ylim=ylim, main="greaterAbs"); drawLines()
+plotMA(resLA, ylim=ylim, main= "lessAbs"); drawLines()
+plotMA(resG, ylim=ylim, main= "greater"); drawLines()
+plotMA(resL, ylim=ylim, main="less"); drawLines()
+#dev.off()
+
+#png("wald_0.33.png", width = 1000, height = 800, res = 120)
+par(mfrow=c(2,2),mar=c(2,2,1,1))
+ylim <- c(-7,7)
+resGA <- results(dds, lfcThreshold=.33, altHypothesis="greaterAbs")
+resLA <- results(dds, lfcThreshold=.33, altHypothesis="lessAbs")
+resG <- results(dds, lfcThreshold=.33, altHypothesis="greater")
+resL <- results(dds, lfcThreshold=.33, altHypothesis="less")
+drawLines <- function() abline(h=c(-.5,.5),col="dodgerblue",lwd=2)
+plotMA(resGA, ylim=ylim, main="greaterAbs"); drawLines()
+plotMA(resLA, ylim=ylim, main= "lessAbs"); drawLines()
+plotMA(resG, ylim=ylim, main= "greater"); drawLines()
+plotMA(resL, ylim=ylim, main="less"); drawLines()
+#dev.off()
+
+#Volcan plot 
+#png("volcano.png", width = 1500, height = 1000,res = 120)
+EnhancedVolcano(res,
+                lab = rownames(res),
+                x = 'log2FoldChange',
+                y = 'pvalue',
+                boxedLabels= TRUE,
+                pointSize = 2.0,
+                labSize = 3)    # Corrected argument name
+
+#dev.off()
+
+#Exportar genes significativos
+tabla_genes<-read.table('genes_significativos_redes.txt',
+                        sep='\t',header = TRUE)
+
+```
+
+### Análisis mediante Machine learning
+
+```{r eval=FALSE}
+#Carga de datos de la matriz generada
+load('Matriz_redes_neuronales_total.RData')
+
+#Modelo de ajuste plda
+rownames(dataset)<-dataset$RowNames
+dataset <- dataset[, -which(names(dataset) == 'RowNames')]
+
+dataset_transpuesto <- as.data.frame(t(dataset))
+nombres_columnas_originales <- colnames(dataset)
+nombres_filas_originales <- rownames(dataset)
+colnames(dataset_transpuesto) <- nombres_filas_originales
+rownames(dataset_transpuesto) <- nombres_columnas_originales
+dataset<-dataset_transpuesto
+rm(dataset_transpuesto)
+
+class <- DataFrame(condition = factor(rep(c("inf","wt"), c(43, 43))))
+
+vars <- sort(apply(dataset, 1, var, na.rm = TRUE), decreasing = TRUE)
+data <- dataset[names(vars)[1:100], ]
+nTest <- ceiling(ncol(data) * 0.3)
+ind <- sample(ncol(data), nTest, FALSE)
+
+data.train <- as.matrix(data[ ,-ind] + 1)
+data.test <- as.matrix(data[ ,ind] + 1)
+classtr <- DataFrame(condition = class[-ind, ])
+classts <- DataFrame(condition = class[ind, ])
+
+data.trainS4 = DESeqDataSetFromMatrix(countData = data.train, 
+                                      colData = classtr, 
+                                      design =formula(~condition))
+
+data.testS4 = DESeqDataSetFromMatrix(countData = data.test, 
+                                     colData = classts,
+                                     design = formula(~condition))
+
+ctrl.plda <- discreteControl(method = "repeatedcv", 
+                             number = 5, repeats = 1,
+                             tuneLength = 10)
+
+fit.plda <- classify(data = data.trainS4, method = "PLDA",
+                     normalize = "deseq",ref = "wt", 
+                     control = ctrl.plda)
+
+pred.plda <- predict(fit.plda, data.testS4)
+pred.plda <- relevel(pred.plda, ref = "wt")
+actual <- relevel(classts$condition, ref = "wt")
+tbl <- table(Predicted = pred.plda, Actual = actual)
+confusionMatrix(tbl, positive = "wt")
+
+sg<-as.data.frame(selectedGenes((fit.plda)))
+
+selectedGenes(fit.svm)
+
+#PCA
+filas <- c(
+  "MI_2958_08", "MI_2958_13", "MI_2958_17", "infectados4", "infectados5", 
+  "infectados6", "infectados7", "infectados8", "infectados9", "infectados10", 
+  "infectados11", "infectados12", "infectados13", "infectados14", "infectados15", 
+  "infectados16", "infectados17", "infectados18", "infectados19", "infectados20", 
+  "infectados21", "infectados22", "infectados23", "infectados24", "infectados25", 
+  "infectados26", "infectados27", "infectados28", "infectados29", "infectados30", 
+  "infectados31", "infectados32", "infectados33", "infectados34", "infectados35", 
+  "infectados36", "infectados37", "infectados38", "infectados39", "infectados40", 
+  "infectados41", "infectados42", "infectados43", "MN_2958_11", "MN_2958_24", 
+  "MN_2958_37", "sanos4", "sanos5", "sanos6", "sanos7", "sanos8", "sanos9", 
+  "sanos10", "sanos11", "sanos12", "sanos13", "sanos14", "sanos15", "sanos16", 
+  "sanos17", "sanos18", "sanos19", "sanos20", "sanos21", "sanos22", "sanos23", 
+  "sanos24", "sanos25", "sanos26", "sanos27", "sanos28", "sanos29", "sanos30", 
+  "sanos31", "sanos32", "sanos33", "sanos34", "sanos35", "sanos36", "sanos37", 
+  "sanos38", "sanos39", "sanos40", "sanos41", "sanos42", "sanos43"
+)
+
+# Crear el vector de condiciones
+condiciones <- rep(c("infected", "wild_type"), times = c(43, 43))
+
+# Crear el DataFrame
+df_coldata <- data.frame(condition = condiciones, row.names = filas)
+
+dds <- DESeqDataSetFromMatrix(countData =dataset ,
+                              colData = df_coldata,
+                              design = ~ condition)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+dds$condition <- factor(dds$condition, levels = c("infected","wild_type"))
+dds <- DESeq(dds)
+vsd <- vst(dds, blind=FALSE)
+pcaData <- plotPCA(vsd, intgroup=c("condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+gg <- ggplot(pcaData, aes(PC1, PC2, color = condition, label = rownames(pcaData))) +
+  geom_point(size = 1.5) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance"))+
+  xlim(-100, 100)  # Establece el rango del eje X
+
+#ggsave('PCA_GANs.png', gg, width = 20, height = 10, units = "cm", dpi = 500)
+
+#Análisis de significación biológica
+selectedEntrezsUP <- tabla_genes$HGNC
+
+# Convertir a caracteres si es necesario
+selectedEntrezsUP <- as.character(selectedEntrezsUP)
+
+# Obtener todos los Entrez IDs disponibles en la base de datos org.Hs.eg.db
+allEntrezs <- keys(org.Hs.eg.db, keytype = "ENTREZID")
+
+# Realizar el análisis de enriquecimiento GO
+ego <- enrichGO(
+  gene = selectedEntrezsUP, 
+  universe = allEntrezs,
+  keyType = "ENTREZID",
+  OrgDb = org.Hs.eg.db, 
+  ont = "BP", 
+  pAdjustMethod = "BH", 
+  qvalueCutoff = 0.05, 
+  readable = TRUE
+)
+ego_results <- data.frame(ego)
+
+#png('ego_dotplot.png')
+dotplot(ego, showCategory=9)
+#dev.off()
+
+#png('ego_cnet.png')
+cnetplot(ego) 
+#dev.off()
+
+```
